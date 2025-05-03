@@ -1,13 +1,17 @@
-import tkinter as tk
+import os
+import csv
 import random
 import math
 import time
-from tkinter import ttk, messagebox
 import numpy as np
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import threading
+import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-
+# Import original Creature and Villain classes from the main simulation
 class Villain:
     """Represents a villain creature that hunts other creatures."""
     
@@ -188,10 +192,148 @@ class Creature:
         return Creature(genome=new_genome)
 
 
+class SimulationData:
+    """Stores and manages data from simulation runs."""
+    
+    def __init__(self):
+        self.current_run = 0
+        self.max_runs = 30
+        self.current_generation = 0
+        self.max_generations = 50
+        
+        # Data for current run
+        self.generation_data = []  # List of dicts for each generation
+        
+        # Summary data across all runs
+        self.run_summaries = []  # List of summary dicts for each run
+        
+        # Output directory
+        self.output_dir = "simulation_results"
+        os.makedirs(self.output_dir, exist_ok=True)
+    
+    def record_generation(self, generation, best_fitness, avg_fitness, eaten, duration):
+        """Record metrics for the current generation."""
+        self.generation_data.append({
+            'Generation': generation,
+            'BestFitness': best_fitness,
+            'AvgFitness': avg_fitness,
+            'Eaten': eaten,
+            'Duration': duration
+        })
+        self.current_generation = generation
+    
+    def finish_run(self, plateau_generation=None):
+        """Finalize the current run and save data."""
+        if not self.generation_data:
+            return
+        
+        # Calculate summary metrics
+        max_best_fitness = max(gen['BestFitness'] for gen in self.generation_data)
+        total_generations = len(self.generation_data)
+        
+        # If plateau wasn't detected during simulation, try to detect it now
+        if plateau_generation is None:
+            plateau_generation = self._detect_plateau()
+        
+        # Create run summary
+        run_summary = {
+            'Run': self.current_run,
+            'MaxBestFitness': max_best_fitness,
+            'PlateauGeneration': plateau_generation if plateau_generation else total_generations,
+            'TotalGenerations': total_generations
+        }
+        self.run_summaries.append(run_summary)
+        
+        # Save this run's data to CSV
+        self._save_run_to_csv()
+        
+        # Clear generation data for next run
+        self.generation_data = []
+        self.current_generation = 0
+        self.current_run += 1
+    
+    def _detect_plateau(self, window_size=5, threshold=0.05):
+        """Detect when fitness has plateaued."""
+        if len(self.generation_data) < window_size * 2:
+            return None
+        
+        best_fitness_values = [gen['BestFitness'] for gen in self.generation_data]
+        
+        for i in range(window_size, len(best_fitness_values) - window_size + 1):
+            window1 = best_fitness_values[i-window_size:i]
+            window2 = best_fitness_values[i:i+window_size]
+            
+            avg1 = sum(window1) / len(window1)
+            avg2 = sum(window2) / len(window2)
+            
+            # If improvement is less than threshold percentage
+            if avg1 > 0 and abs((avg2 - avg1) / avg1) < threshold:
+                return i
+        
+        return None
+    
+    def _save_run_to_csv(self):
+        """Save the current run's generation data to a CSV file."""
+        filename = os.path.join(self.output_dir, f"run_{self.current_run}_data.csv")
+        
+        with open(filename, 'w', newline='') as csvfile:
+            fieldnames = ['Generation', 'BestFitness', 'AvgFitness', 'Eaten', 'Duration']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            
+            writer.writeheader()
+            for gen_data in self.generation_data:
+                writer.writerow(gen_data)
+    
+    def save_summary_to_csv(self):
+        """Save summary data for all runs to a CSV file."""
+        if not self.run_summaries:
+            return
+            
+        filename = os.path.join(self.output_dir, "simulation_summary.csv")
+        
+        with open(filename, 'w', newline='') as csvfile:
+            fieldnames = ['Run', 'MaxBestFitness', 'PlateauGeneration', 'TotalGenerations']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            
+            writer.writeheader()
+            for summary in self.run_summaries:
+                writer.writerow(summary)
+    
+    def plot_fitness_comparison(self):
+        """Create and save a plot comparing fitness across runs."""
+        if not self.run_summaries:
+            return
+            
+        # Create the figure
+        plt.figure(figsize=(10, 6))
+        
+        runs = [summary['Run'] for summary in self.run_summaries]
+        max_fitness = [summary['MaxBestFitness'] for summary in self.run_summaries]
+        plateau_gens = [summary['PlateauGeneration'] for summary in self.run_summaries]
+        
+        plt.subplot(1, 2, 1)
+        plt.bar(runs, max_fitness)
+        plt.xlabel('Run')
+        plt.ylabel('Max Best Fitness')
+        plt.title('Maximum Fitness per Run')
+        
+        plt.subplot(1, 2, 2)
+        plt.bar(runs, plateau_gens)
+        plt.xlabel('Run')
+        plt.ylabel('Generation')
+        plt.title('Plateau Generation per Run')
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.output_dir, "fitness_comparison.png"))
+        plt.close()
+
+
+# Modifications to GeneticSimulator class
 class GeneticSimulator:
     """Manages the genetic algorithm and simulation."""
     
-    def __init__(self, canvas_width, canvas_height, population_size=20):
+    def __init__(self, canvas_width, canvas_height, population_size=20, 
+                data_collector=None, max_generations=50, epsilon=0.05):
         self.width = canvas_width
         self.height = canvas_height
         self.population_size = population_size
@@ -200,11 +342,19 @@ class GeneticSimulator:
         self.generation = 1
         self.best_fitness_history = []
         self.avg_fitness_history = []
+        self.eaten_history = []  # Track creatures eaten by villain
+        self.length_history = []  # Track duration of each generation
         self.time_step = 0
         self.add_food(20)
         self.villain = Villain(canvas_width, canvas_height)
         self.creatures_eaten = 0
         
+        # Data collection
+        self.data_collector = data_collector
+        self.max_generations = max_generations
+        self.epsilon = epsilon  # Threshold for plateau detection
+        self.plateau_detected = False
+    
     def add_food(self, count):
         """Add food items to the simulation."""
         for _ in range(count):
@@ -253,6 +403,10 @@ class GeneticSimulator:
     
     def evolve(self):
         """Move to next generation using genetic algorithm."""
+        # Record generation data
+        best_fitness = 0
+        avg_fitness = 0
+        
         # Calculate fitness
         if self.creatures:
             total_fitness = sum(creature.fitness for creature in self.creatures)
@@ -263,6 +417,19 @@ class GeneticSimulator:
                 avg_fitness = total_fitness / len(self.creatures)
                 self.best_fitness_history.append(best_fitness)
                 self.avg_fitness_history.append(avg_fitness)
+                self.eaten_history.append(self.creatures_eaten)
+                self.length_history.append(self.time_step)
+                
+                # Check for plateau
+                if len(self.best_fitness_history) >= 5:  # Need at least 5 generations
+                    self._check_plateau()
+                
+                # Save generation data if collector is available
+                if self.data_collector:
+                    self.data_collector.record_generation(
+                        self.generation, best_fitness, avg_fitness, 
+                        self.creatures_eaten, self.time_step
+                    )
                 
                 # Select parents based on fitness (roulette wheel selection)
                 parents = []
@@ -310,11 +477,27 @@ class GeneticSimulator:
                 # If all fitness is zero, create fresh generation
                 self.best_fitness_history.append(0)
                 self.avg_fitness_history.append(0)
+                self.eaten_history.append(self.creatures_eaten)
+                self.length_history.append(self.time_step)
+                
+                if self.data_collector:
+                    self.data_collector.record_generation(
+                        self.generation, 0, 0, self.creatures_eaten, self.time_step
+                    )
+                
                 new_generation = [Creature() for _ in range(self.population_size)]
         else:
             # All creatures eaten, create fresh generation
             self.best_fitness_history.append(0)
             self.avg_fitness_history.append(0)
+            self.eaten_history.append(self.creatures_eaten)
+            self.length_history.append(self.time_step)
+            
+            if self.data_collector:
+                self.data_collector.record_generation(
+                    self.generation, 0, 0, self.creatures_eaten, self.time_step
+                )
+            
             new_generation = [Creature() for _ in range(self.population_size)]
         
         # Replace old generation
@@ -329,8 +512,382 @@ class GeneticSimulator:
         # Reset villain position
         self.villain = Villain(self.width, self.height)
         self.creatures_eaten = 0
+    
+    def _check_plateau(self, window=5):
+        """Check if fitness has plateaued."""
+        if self.plateau_detected or len(self.best_fitness_history) < window * 2:
+            return False
+            
+        # Get recent fitness values
+        recent = self.best_fitness_history[-window:]
+        previous = self.best_fitness_history[-(window*2):-window]
+        
+        # Calculate average improvement
+        avg_recent = sum(recent) / window
+        avg_previous = sum(previous) / window
+        
+        # Check if improvement is below threshold
+        if avg_previous > 0 and abs((avg_recent - avg_previous) / avg_previous) < self.epsilon:
+            self.plateau_detected = True
+            return True
+            
+        return False
+    
+    def should_terminate(self):
+        """Check if simulation should terminate based on generations or plateau."""
+        if self.generation > self.max_generations:
+            return True
+            
+        if self.plateau_detected:
+            return True
+            
+        return False
+    
+    def get_plateau_generation(self):
+        """Return the generation where plateau was detected, or None."""
+        if self.plateau_detected:
+            # Find the generation where plateau was first detected
+            # This is approximate based on when _check_plateau returned True
+            return max(1, self.generation - 5)
+        return None
 
 
+# BatchSimulationRunner to handle multiple simulation runs
+class BatchSimulationRunner:
+    """Manages batch execution of multiple simulation runs."""
+    
+    def __init__(self, canvas_width, canvas_height, num_runs=30, 
+                population_size=20, max_generations=50):
+        self.canvas_width = canvas_width
+        self.canvas_height = canvas_height
+        self.num_runs = num_runs
+        self.population_size = population_size
+        self.max_generations = max_generations
+        
+        self.data_collector = SimulationData()
+        self.data_collector.max_runs = num_runs
+        self.data_collector.max_generations = max_generations
+        
+        self.current_run = 0
+        self.running = False
+        self.paused = False
+        
+        # Current simulator instance
+        self.simulator = None
+        
+        # GUI callback functions
+        self.on_progress_update = None
+        self.on_run_complete = None
+        self.on_batch_complete = None
+    
+    def start(self):
+        """Start the batch simulation."""
+        if self.running:
+            return
+            
+        self.running = True
+        self.current_run = 0
+        
+        # Start simulation thread
+        thread = threading.Thread(target=self._run_batch)
+        thread.daemon = True
+        thread.start()
+    
+    def pause(self):
+        """Pause the batch simulation."""
+        self.paused = not self.paused
+        return self.paused
+    
+    def stop(self):
+        """Stop the batch simulation."""
+        self.running = False
+    
+    def _run_batch(self):
+        """Run all simulations in the batch."""
+        self.data_collector.current_run = 0
+        
+        for run in range(self.num_runs):
+            if not self.running:
+                break
+                
+            self.current_run = run
+            self.data_collector.current_run = run
+            
+            # Initialize new simulator
+            self.simulator = GeneticSimulator(
+                self.canvas_width, self.canvas_height,
+                population_size=self.population_size,
+                data_collector=self.data_collector,
+                max_generations=self.max_generations
+            )
+            
+            # Run this simulation
+            self._run_single_simulation()
+            
+            # Finalize data for this run
+            self.data_collector.finish_run(self.simulator.get_plateau_generation())
+            
+            # Notify of run completion
+            if self.on_run_complete:
+                self.on_run_complete(run)
+        
+        # Save summary data when all runs complete
+        self.data_collector.save_summary_to_csv()
+        self.data_collector.plot_fitness_comparison()
+        
+        # Notify of batch completion
+        if self.on_batch_complete:
+            self.on_batch_complete()
+        
+        self.running = False
+    
+    def _run_single_simulation(self):
+        """Run a single simulation until termination."""
+        generation_count = 0
+        
+        while self.running and not self.simulator.should_terminate():
+            # Handle pause
+            while self.paused and self.running:
+                time.sleep(0.1)
+                
+            if not self.running:
+                break
+                
+            # Run a full generation
+            while not self.simulator.update():
+                # Update progress more frequently for responsive UI
+                if self.simulator.time_step % 50 == 0 and self.on_progress_update:
+                    self.on_progress_update(
+                        self.current_run, self.simulator.generation, 
+                        self.simulator.time_step, False
+                    )
+                    
+                # Small sleep to prevent CPU hogging
+                time.sleep(0.001)
+            
+            # Generation complete
+            generation_count += 1
+            
+            # Update progress after each generation
+            if self.on_progress_update:
+                self.on_progress_update(
+                    self.current_run, self.simulator.generation, 
+                    self.simulator.time_step, True
+                )
+
+
+# GUI extension for batch simulation
+class BatchSimulationApp:
+    """GUI application for running batch simulations."""
+    
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Creature Evolution Batch Simulator")
+        
+        # Set up batch runner
+        self.canvas_width = 800
+        self.canvas_height = 600
+        self.batch_runner = BatchSimulationRunner(
+            self.canvas_width, self.canvas_height
+        )
+        
+        # Connect callbacks
+        self.batch_runner.on_progress_update = self.update_progress
+        self.batch_runner.on_run_complete = self.on_run_complete
+        self.batch_runner.on_batch_complete = self.on_batch_complete
+        
+        # Setup UI
+        self.setup_ui()
+    
+    def setup_ui(self):
+        """Create the UI for batch simulation control."""
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Parameters frame
+        params_frame = ttk.LabelFrame(main_frame, text="Simulation Parameters", padding="10")
+        params_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
+        
+        # Number of runs
+        ttk.Label(params_frame, text="Number of Runs:").grid(row=0, column=0, sticky="w")
+        self.runs_var = tk.StringVar(value="30")
+        runs_entry = ttk.Entry(params_frame, textvariable=self.runs_var, width=5)
+        runs_entry.grid(row=0, column=1, sticky="w", padx=5)
+        
+        # Population size
+        ttk.Label(params_frame, text="Population Size:").grid(row=1, column=0, sticky="w")
+        self.pop_var = tk.StringVar(value="20")
+        pop_entry = ttk.Entry(params_frame, textvariable=self.pop_var, width=5)
+        pop_entry.grid(row=1, column=1, sticky="w", padx=5)
+        
+        # Max generations
+        ttk.Label(params_frame, text="Max Generations:").grid(row=2, column=0, sticky="w")
+        self.gen_var = tk.StringVar(value="50")
+        gen_entry = ttk.Entry(params_frame, textvariable=self.gen_var, width=5)
+        gen_entry.grid(row=2, column=1, sticky="w", padx=5)
+        
+        # Output directory
+        ttk.Label(params_frame, text="Output Directory:").grid(row=3, column=0, sticky="w")
+        self.dir_var = tk.StringVar(value="simulation_results")
+        dir_entry = ttk.Entry(params_frame, textvariable=self.dir_var, width=30)
+        dir_entry.grid(row=3, column=1, columnspan=2, sticky="ew", padx=5)
+        dir_button = ttk.Button(params_frame, text="Browse...", command=self.browse_directory)
+        dir_button.grid(row=3, column=3, padx=5)
+        
+        # Control buttons
+        control_frame = ttk.Frame(main_frame)
+        control_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=10)
+        
+        self.start_button = ttk.Button(control_frame, text="Start Batch", command=self.start_batch)
+        self.start_button.pack(side=tk.LEFT, padx=5)
+        
+        self.pause_button = ttk.Button(control_frame, text="Pause", command=self.pause_batch, state=tk.DISABLED)
+        self.pause_button.pack(side=tk.LEFT, padx=5)
+        
+        self.stop_button = ttk.Button(control_frame, text="Stop", command=self.stop_batch, state=tk.DISABLED)
+        self.stop_button.pack(side=tk.LEFT, padx=5)
+        
+        # Progress frame
+        progress_frame = ttk.LabelFrame(main_frame, text="Progress", padding="10")
+        progress_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=10)
+        
+        # Overall progress
+        ttk.Label(progress_frame, text="Overall Progress:").grid(row=0, column=0, sticky="w")
+        self.overall_progress = ttk.Progressbar(progress_frame, orient=tk.HORIZONTAL, length=400, mode='determinate')
+        self.overall_progress.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+        
+        # Current run progress
+        ttk.Label(progress_frame, text="Current Run:").grid(row=1, column=0, sticky="w")
+        self.run_progress = ttk.Progressbar(progress_frame, orient=tk.HORIZONTAL, length=400, mode='determinate')
+        self.run_progress.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
+        
+        # Current generation progress
+        ttk.Label(progress_frame, text="Current Generation:").grid(row=2, column=0, sticky="w")
+        self.gen_progress = ttk.Progressbar(progress_frame, orient=tk.HORIZONTAL, length=400, mode='determinate')
+        self.gen_progress.grid(row=2, column=1, padx=5, pady=5, sticky="ew")
+        
+        # Status label
+        self.status_var = tk.StringVar(value="Ready to start")
+        status_label = ttk.Label(progress_frame, textvariable=self.status_var)
+        status_label.grid(row=3, column=0, columnspan=2, padx=5, pady=5)
+        
+        # Configure grid weights
+        main_frame.columnconfigure(0, weight=1)
+        progress_frame.columnconfigure(1, weight=1)
+    
+    def browse_directory(self):
+        """Browse for output directory."""
+        directory = filedialog.askdirectory()
+        if directory:
+            self.dir_var.set(directory)
+            self.batch_runner.data_collector.output_dir = directory
+    
+    def start_batch(self):
+        """Start the batch simulation."""
+        try:
+            num_runs = int(self.runs_var.get())
+            pop_size = int(self.pop_var.get())
+            max_gens = int(self.gen_var.get())
+            
+            if num_runs < 1 or pop_size < 2 or max_gens < 1:
+                messagebox.showerror("Invalid Parameters", 
+                                     "All parameters must be positive numbers.")
+                return
+                
+            # Update batch runner parameters
+            self.batch_runner.num_runs = num_runs
+            self.batch_runner.population_size = pop_size
+            self.batch_runner.max_generations = max_gens
+            self.batch_runner.data_collector.max_runs = num_runs
+            self.batch_runner.data_collector.max_generations = max_gens
+            self.batch_runner.data_collector.output_dir = self.dir_var.get()
+            
+            # Create output directory if it doesn't exist
+            os.makedirs(self.dir_var.get(), exist_ok=True)
+            
+            # Start simulation
+            self.batch_runner.start()
+            
+            # Update UI
+            self.start_button.config(state=tk.DISABLED)
+            self.pause_button.config(state=tk.NORMAL)
+            self.stop_button.config(state=tk.NORMAL)
+            
+            # Reset progress bars
+            self.overall_progress['maximum'] = num_runs
+            self.overall_progress['value'] = 0
+            self.run_progress['maximum'] = max_gens
+            self.run_progress['value'] = 0
+            self.gen_progress['maximum'] = 500  # Default generation length
+            self.gen_progress['value'] = 0
+            
+            self.status_var.set(f"Starting batch simulation: {num_runs} runs")
+            
+        except ValueError:
+            messagebox.showerror("Invalid Parameters", 
+                                "All parameters must be valid numbers.")
+    
+    def pause_batch(self):
+        """Pause or resume the batch simulation."""
+        is_paused = self.batch_runner.pause()
+        if is_paused:
+            self.pause_button.config(text="Resume")
+            self.status_var.set("Simulation paused")
+        else:
+            self.pause_button.config(text="Pause")
+            self.status_var.set("Simulation running")
+    
+    def stop_batch(self):
+        """Stop the batch simulation."""
+        self.batch_runner.stop()
+        self.start_button.config(state=tk.NORMAL)
+        self.pause_button.config(state=tk.DISABLED)
+        self.stop_button.config(state=tk.DISABLED)
+        self.status_var.set("Simulation stopped")
+    
+    def update_progress(self, run, generation, time_step, gen_complete):
+        """Update progress bars based on simulation progress."""
+        # Update overall progress
+        self.overall_progress['value'] = run
+        
+        # Update run progress (generations)
+        self.run_progress['value'] = generation
+        
+        # Update generation progress
+        if gen_complete:
+            self.gen_progress['value'] = 500  # Complete
+        else:
+            self.gen_progress['value'] = time_step
+        
+        self.status_var.set(f"Run {run+1}/{self.batch_runner.num_runs}, "
+                           f"Generation {generation}/{self.batch_runner.max_generations}, "
+                           f"Time step: {time_step}")
+        
+        # Force UI update
+        self.root.update_idletasks()
+    
+    def on_run_complete(self, run):
+        """Handler for completion of a single run."""
+        self.overall_progress['value'] = run + 1
+        self.run_progress['value'] = 0
+        self.gen_progress['value'] = 0
+        self.status_var.set(f"Completed run {run+1}/{self.batch_runner.num_runs}")
+        self.root.update_idletasks()
+    
+    def on_batch_complete(self):
+        """Handler for completion of the entire batch."""
+        self.start_button.config(state=tk.NORMAL)
+        self.pause_button.config(state=tk.DISABLED)
+        self.stop_button.config(state=tk.DISABLED)
+        
+        self.status_var.set(f"Batch complete! Results saved to {self.dir_var.get()}")
+        
+        messagebox.showinfo("Batch Complete", 
+                           f"All {self.batch_runner.num_runs} simulation runs completed.\n"
+                           f"Results saved to {self.dir_var.get()}")
+
+
+# Add original visualization app
 class EvolutionApp:
     """Main application for the evolution simulator."""
     
@@ -571,10 +1128,24 @@ class EvolutionApp:
         self.canvas_plot.draw()
 
 
+# Modify main function to offer both visualization and batch modes
 def main():
     """Run the application."""
     root = tk.Tk()
-    app = EvolutionApp(root)
+    
+    # Ask user which mode to run
+    mode = messagebox.askquestion("Start Mode", 
+                                 "Do you want to run in batch data collection mode?\n\n"
+                                 "Yes: Run multiple simulations and collect data\n"
+                                 "No: Run interactive visualization")
+    
+    if mode == 'yes':
+        # Batch data collection mode
+        app = BatchSimulationApp(root)
+    else:
+        # Interactive visualization mode
+        app = EvolutionApp(root)
+    
     root.geometry("1200x700")
     root.protocol("WM_DELETE_WINDOW", root.quit)
     root.mainloop()
